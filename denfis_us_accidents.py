@@ -37,65 +37,236 @@ Contrast with MLP (from your textbook):
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
+import pickle
+import os
 import warnings
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────
-#  1. MEMORY-SAFE DATA LOADING
-#     The full dataset has 7.7 M rows → load only 600 000 rows.
+#  1. CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-DATA_FILE = "US_Accidents_March23.csv"   # ← put your Kaggle CSV here
-NROWS     = 600_000                      # change freely (500k–1M safe)
+DATA_FILE  = "US_Accidents_March23.csv"   # ← put your Kaggle CSV here
+
+# Rows read per chunk.  100 000 rows ≈ 30 MB RAM — safe on any machine.
+# The CSV is never fully loaded; only one chunk lives in memory at a time.
+CHUNK_SIZE = 100_000
 
 FEATURE_COLS = ["Temperature(F)", "Visibility(mi)", "Humidity(%)"]
-TARGET_COL   = "Severity"   # integer 1-4
+TARGET_COL   = "Severity"   # integer 1–4
 
+# Hard physical limits — silently drops sensor outliers before scaling
+FEATURE_CLIP = {
+    "Temperature(F)": (-60.0, 160.0),
+    "Visibility(mi)": (  0.0,  10.0),
+    "Humidity(%)":    (  0.0, 100.0),
+}
+
+DTYPE_MAP = {
+    "Temperature(F)": "float32",
+    "Visibility(mi)": "float32",
+    "Humidity(%)":    "float32",
+    "Severity":       "int8",
+}
+
+
+# ─────────────────────────────────────────────────────────────
+#  PASS 1 — fit_scaler_streaming
+#
+#  Reads the full CSV once, one CHUNK_SIZE chunk at a time.
+#  Never stores more than one chunk in RAM.
+#  Tracks global min/max per column → builds MinMaxScaler.
+#  Tracks per-column medians via a capped reservoir → used to
+#  fill NaN values during training.
+#  Also counts total valid rows so we can compute 80/20 split.
+# ─────────────────────────────────────────────────────────────
+
+def fit_scaler_streaming(filepath: str) -> tuple:
+    """
+    Single-pass scan of the full CSV.
+
+    Returns
+    -------
+    scaler  : MinMaxScaler  fitted on global [min, max] per column
+    medians : dict          {col_name: median_value}  for NaN filling
+    n_total : int           total valid (non-NaN, severity 1-4) rows
+    """
+    print(f"\n[PASS 1/3]  Scanning '{filepath}' …")
+    print( "            (reads every chunk once to fit the scaler)")
+
+    col_min    = {c:  float("inf") for c in FEATURE_COLS}
+    col_max    = {c: float("-inf") for c in FEATURE_COLS}
+    RESERVOIR  = 500_000          # cap reservoir at 500 k values per column
+    reservoirs = {c: [] for c in FEATURE_COLS}
+    n_total    = 0
+
+    for chunk in pd.read_csv(filepath,
+                              usecols=FEATURE_COLS + [TARGET_COL],
+                              dtype=DTYPE_MAP,
+                              chunksize=CHUNK_SIZE,
+                              low_memory=True):
+
+        # Drop rows where the target is missing or invalid
+        chunk = chunk.dropna(subset=[TARGET_COL])
+        chunk = chunk[chunk[TARGET_COL].between(1, 4)]
+        if chunk.empty:
+            continue
+
+        for col in FEATURE_COLS:
+            vals = chunk[col].dropna()
+            lo, hi = FEATURE_CLIP[col]
+            vals   = vals.clip(lo, hi)
+            if vals.empty:
+                continue
+            col_min[col] = min(col_min[col], float(vals.min()))
+            col_max[col] = max(col_max[col], float(vals.max()))
+            space = RESERVOIR - len(reservoirs[col])
+            if space > 0:
+                reservoirs[col].extend(vals.iloc[:space].tolist())
+
+        n_total += len(chunk)
+        print(f"  … {n_total:>8,} rows scanned", end="\r")
+
+    print(f"\n[PASS 1/3]  Done.  Valid rows: {n_total:,}")
+
+    medians = {c: float(np.median(v)) if v else 0.0
+               for c, v in reservoirs.items()}
+    print(f"            Medians : { {c: round(medians[c], 2) for c in FEATURE_COLS} }")
+    print(f"            Ranges  : { {c: (round(col_min[c],1), round(col_max[c],1)) for c in FEATURE_COLS} }")
+
+    scaler = MinMaxScaler()
+    scaler.fit(np.array([[col_min[c] for c in FEATURE_COLS],
+                         [col_max[c] for c in FEATURE_COLS]], dtype=np.float64))
+    return scaler, medians, n_total
+
+
+# ─────────────────────────────────────────────────────────────
+#  PASS 2 — stream_train
+#
+#  Reads the full CSV a SECOND time, chunk by chunk.
+#  The first 80 % of valid rows → training (fed to DENFIS online).
+#  The remaining 20 %          → accumulated as the test set.
+#
+#  How the 80/20 boundary works without loading everything:
+#    train_budget = int(0.8 * n_total)
+#    We count valid rows as we go.  While trained_rows < train_budget
+#    every row goes to model.train_one().  Once we cross the boundary
+#    the rest are collected into X_test / y_test lists and returned.
+#
+#  Peak RAM at any moment = one chunk (~30 MB) + test set rows
+#  accumulated so far.  For 7.7 M rows the test set is ~1.54 M rows
+#  × 3 features × 8 bytes ≈ 37 MB.  Total peak ≈ 70 MB.
+# ─────────────────────────────────────────────────────────────
+
+def _clean_chunk(chunk: pd.DataFrame, medians: dict) -> pd.DataFrame:
+    """Fill NaNs with medians, clip sensor outliers, drop bad rows."""
+    for col in FEATURE_COLS:
+        chunk[col].fillna(medians[col], inplace=True)
+        lo, hi = FEATURE_CLIP[col]
+        chunk[col] = chunk[col].clip(lo, hi)
+    chunk = chunk.dropna()
+    chunk = chunk[chunk[TARGET_COL].between(1, 4)]
+    return chunk
+
+
+def stream_train(model, filepath: str,
+                 scaler, medians: dict, n_total: int) -> tuple:
+    """
+    True streaming training — only one chunk in RAM at a time.
+
+    The 80/20 train/test split is enforced by a running counter:
+    rows are sent to model.train_one() until train_budget is reached,
+    then accumulated into the test arrays.
+
+    Returns
+    -------
+    X_test : np.ndarray  shape (n_test, 3)  normalised to [0, 1]
+    y_test : np.ndarray  shape (n_test,)    normalised to [0, 1]
+    """
+    train_budget = int(0.8 * n_total)
+    est_chunks   = max(1, n_total // CHUNK_SIZE)
+
+    print(f"\n[PASS 2/3]  Streaming training …")
+    print(f"            D_thr={model.ecm.D_thr}  "
+          f"sigma={model.sigma_scale}  lambda={model.lam}")
+    print(f"            Train budget : {train_budget:,} rows  "
+          f"(80 % of {n_total:,})")
+    print(f"            Test set     : ~{n_total - train_budget:,} rows  "
+          f"(last 20 %)")
+
+    trained_rows  = 0
+    X_test_parts  = []
+    y_test_parts  = []
+    chunk_idx     = 0
+
+    for chunk in pd.read_csv(filepath,
+                              usecols=FEATURE_COLS + [TARGET_COL],
+                              dtype=DTYPE_MAP,
+                              chunksize=CHUNK_SIZE,
+                              low_memory=True):
+
+        chunk = _clean_chunk(chunk, medians)
+        if chunk.empty:
+            continue
+
+        chunk_idx += 1
+        X_raw  = chunk[FEATURE_COLS].values.astype(np.float64)
+        X_norm = scaler.transform(X_raw)
+        y_norm = (chunk[TARGET_COL].values.astype(np.float64) - 1.0) / 3.0
+        n_rows = len(X_norm)
+
+        if trained_rows >= train_budget:
+            # ── entirely in the test zone ────────────────────────────
+            X_test_parts.append(X_norm)
+            y_test_parts.append(y_norm)
+
+        elif trained_rows + n_rows <= train_budget:
+            # ── entirely in the training zone ───────────────────────
+            for i in range(n_rows):
+                model.train_one(X_norm[i], y_norm[i])
+            trained_rows += n_rows
+
+        else:
+            # ── this chunk straddles the boundary ───────────────────
+            cut = train_budget - trained_rows      # rows that still go to train
+            for i in range(cut):
+                model.train_one(X_norm[i], y_norm[i])
+            trained_rows += cut
+            # remainder goes to test
+            X_test_parts.append(X_norm[cut:])
+            y_test_parts.append(y_norm[cut:])
+
+        pct = min(trained_rows / train_budget * 100, 100.0)
+        print(f"  Chunk {chunk_idx:>4} (~{chunk_idx*CHUNK_SIZE:>8,} raw rows)  |  "
+              f"Trained: {trained_rows:>8,}  |  "
+              f"Rules: {model.ecm.n_clusters():>4}  |  {pct:5.1f}%")
+
+    X_test = np.vstack(X_test_parts)
+    y_test = np.concatenate(y_test_parts)
+
+    print(f"\n[PASS 2/3]  Done.")
+    print(f"            Rows trained : {trained_rows:,}")
+    print(f"            Test rows    : {len(X_test):,}")
+    print(f"            Fuzzy rules  : {model.ecm.n_clusters()}")
+    return X_test, y_test
+
+
+# ─────────────────────────────────────────────────────────────
+#  Legacy helper — kept so test_denfis.py still works
+# ─────────────────────────────────────────────────────────────
 
 def load_and_preprocess(filepath: str, nrows: int) -> tuple:
-    """
-    Load a memory-safe subset, drop bad rows, normalise features to [0,1].
-    Returns X (np.ndarray), y (np.ndarray), scaler, raw DataFrame.
-    """
-    print(f"\n[DATA]  Loading {nrows:,} rows from '{filepath}' …")
-
-    # Specify dtypes to cut RAM usage by ~30 %
-    dtype_map = {
-        "Temperature(F)": "float32",
-        "Visibility(mi)": "float32",
-        "Humidity(%)":    "float32",
-        "Severity":       "int8",
-    }
-
-    df = pd.read_csv(
-        filepath,
-        nrows=nrows,
-        usecols=FEATURE_COLS + [TARGET_COL],
-        dtype=dtype_map,
-        low_memory=True,
-    )
-
-    print(f"[DATA]  Loaded shape : {df.shape}")
-    print(f"[DATA]  Missing values before cleaning:\n{df.isnull().sum()}")
-
-    # ── Handle missing values ──────────────────────────────────────────
-    # Strategy: fill with column median (robust to outliers in weather data)
+    """Load a fixed-size subset (used only by the unit-test script)."""
+    df = pd.read_csv(filepath, nrows=nrows,
+                     usecols=FEATURE_COLS + [TARGET_COL],
+                     dtype=DTYPE_MAP, low_memory=True)
     for col in FEATURE_COLS:
-        median_val = df[col].median()
-        df[col].fillna(median_val, inplace=True)
-
-    # Drop any remaining NaN rows (should be 0 after above, but safety net)
+        df[col].fillna(df[col].median(), inplace=True)
     df.dropna(inplace=True)
-    print(f"[DATA]  Shape after cleaning : {df.shape}")
-
-    # ── Normalise features to [0, 1] ──────────────────────────────────
+    df = df[df[TARGET_COL].between(1, 4)]
     scaler = MinMaxScaler()
     X = scaler.fit_transform(df[FEATURE_COLS].values).astype(np.float64)
-
-    # Normalise target to [0, 1] so MSE is scale-independent
-    y = (df[TARGET_COL].values.astype(np.float64) - 1.0) / 3.0  # 1-4 → 0-1
-
-    print(f"[DATA]  X shape: {X.shape},  y range: [{y.min():.3f}, {y.max():.3f}]")
+    y = (df[TARGET_COL].values.astype(np.float64) - 1.0) / 3.0
     return X, y, scaler, df
 
 
@@ -496,56 +667,152 @@ def evaluate(model: DENFIS,
 
 
 # ─────────────────────────────────────────────────────────────
-#  6. MAIN PIPELINE
+#  6. MODEL EXPORT & IMPORT
+# ─────────────────────────────────────────────────────────────
+
+MODEL_PATH = "denfis_trained_model.pkl"   # ← file that gets saved/loaded
+
+
+def save_model(model: "DENFIS", scaler: MinMaxScaler,
+               metrics: dict, path: str = MODEL_PATH) -> None:
+    """
+    Serialise the trained DENFIS + scaler + training metrics to a .pkl file.
+
+    Everything needed to make predictions on new data is bundled together:
+      • model   — the DENFIS object (ECM clusters + RLS weights)
+      • scaler  — the fitted MinMaxScaler (must use the SAME scaler that
+                  was used during training, otherwise inputs are on a
+                  different scale and predictions will be garbage)
+      • metrics — MSE / MAE recorded at evaluation time
+      • meta    — hyper-parameters and dataset info for reproducibility
+    """
+    bundle = {
+        "model":   model,
+        "scaler":  scaler,
+        "metrics": metrics,
+        "meta": {
+            "n_rules":      model.ecm.n_clusters(),
+            "n_features":   model.n_features,
+            "feature_cols": FEATURE_COLS,
+            "target_col":   TARGET_COL,
+            "D_thr":        model.ecm.D_thr,
+            "sigma_scale":  model.sigma_scale,
+            "lambda":       model.lam,
+        },
+    }
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    size_kb = os.path.getsize(path) / 1024
+    print(f"\n[SAVE]  Model exported → '{path}'  ({size_kb:.1f} KB)")
+    print(f"        Bundled: DENFIS ({model.ecm.n_clusters()} rules) + "
+          f"scaler + metrics")
+
+
+def load_model(path: str = MODEL_PATH) -> tuple:
+    """
+    Load a previously saved DENFIS bundle.
+
+    Returns
+    -------
+    model   : DENFIS  — ready for predict_one() / predict()
+    scaler  : MinMaxScaler — use to normalise raw inputs before predicting
+    metrics : dict    — training-time performance numbers
+    meta    : dict    — hyper-parameters and dataset info
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No saved model found at '{path}'.\n"
+            f"Run  python denfis_us_accidents.py  first to train and export."
+        )
+    # ── Pickle fix ────────────────────────────────────────────────────────
+    # pickle saves class objects by their *module path*.  When the pkl was
+    # created, DENFIS and ECM lived in __main__ (denfis_us_accidents.py).
+    # When test_trained_model.py loads the file, __main__ is the tester,
+    # so pickle cannot find the classes and raises AttributeError.
+    # Solution: a custom Unpickler that redirects any class stored under
+    # __main__ to denfis_us_accidents (where DENFIS and ECM always live).
+    import denfis_us_accidents as _self_module
+
+    class _FixedUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module == "__main__":
+                return getattr(_self_module, name)
+            return super().find_class(module, name)
+
+    with open(path, "rb") as f:
+        bundle = _FixedUnpickler(f).load()
+
+    model   = bundle["model"]
+    scaler  = bundle["scaler"]
+    metrics = bundle["metrics"]
+    meta    = bundle["meta"]
+
+    print(f"\n[LOAD]  Model loaded from '{path}'")
+    print(f"        Rules: {meta['n_rules']}  |  "
+          f"Features: {meta['feature_cols']}  |  "
+          f"D_thr: {meta['D_thr']}")
+    return model, scaler, metrics, meta
+
+
+# ─────────────────────────────────────────────────────────────
+#  7. MAIN PIPELINE
 # ─────────────────────────────────────────────────────────────
 
 def main():
-    # ── 6.1  Load data ──────────────────────────────────────────────
-    X, y, scaler, df = load_and_preprocess(DATA_FILE, NROWS)
+    import time
+    t0 = time.time()
 
-    # ── 6.2  Train / test split (80 / 20, chronological order) ──────
-    split = int(0.8 * len(X))
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
-    print(f"[SPLIT] Train: {len(X_train):,}  |  Test: {len(X_test):,}")
+    # ── Step 1: Scan full CSV, fit scaler ─────────────────────────────
+    #   Reads the file once.  No model training.  No full-dataset load.
+    scaler, medians, n_total = fit_scaler_streaming(DATA_FILE)
 
-    # ── 6.3  Instantiate and train DENFIS ───────────────────────────
-    #
-    # Hyper-parameter guidance:
-    #   D_thr = 0.20 → fine-grained (more rules, slower)
-    #   D_thr = 0.35 → coarse (fewer rules, faster)
-    #   sigma_scale scales Gaussian width relative to cluster radius.
-    #   lambda_forget = 0.99 → slight preference for recent data.
-    #
+    # ── Step 2: Build DENFIS ──────────────────────────────────────────
+    #   D_thr = 0.30 keeps the rule count manageable across 7.7 M rows.
+    #   A smaller D_thr (e.g. 0.20) creates more rules but slows the
+    #   RLS matrix operations proportionally.
     model = DENFIS(
-        D_thr         = 0.25,
+        D_thr         = 0.30,
         sigma_scale   = 1.0,
         lambda_forget = 0.99,
         rls_init_cov  = 1000.0,
     )
-    model.fit(X_train, y_train, log_every=50_000)
 
-    # ── 6.4  Evaluate ───────────────────────────────────────────────
+    # ── Step 3: Stream-train over the full dataset ────────────────────
+    #   Reads the file a second time, chunk by chunk.
+    #   80 % of valid rows → model.train_one() (online, one row at a time)
+    #   20 % of valid rows → held back as the test set
+    #   Peak RAM ≈ one chunk + test set ≈ 70 MB total.
+    X_test, y_test = stream_train(model, DATA_FILE, scaler, medians, n_total)
+
+    elapsed = time.time() - t0
+    print(f"\n[PASS 3/3]  Training wall-clock time: {elapsed/60:.1f} min")
+
+    # ── Step 4: Evaluate on the held-back 20 % ───────────────────────
     metrics = evaluate(model, X_test, y_test)
 
-    # ── 6.5  Extract & print 3 fuzzy rules ──────────────────────────
+    # ── Step 5: Print 3 human-readable fuzzy rules ───────────────────
     extract_rules(model, FEATURE_NAMES, n_rules=3)
 
-    # ── 6.6  Quick sanity prediction example ────────────────────────
-    print("─── Example single-sample prediction ───────────────────────")
-    sample_raw = np.array([[72.0, 10.0, 65.0]])           # realistic values
+    # ── Step 6: Quick sanity prediction ──────────────────────────────
+    print("─── Example prediction ──────────────────────────────────────")
+    sample_raw  = np.array([[72.0, 10.0, 65.0]])
     sample_norm = scaler.transform(sample_raw)[0]
     pred_norm   = model.predict_one(sample_norm)
     pred_sev    = np.clip(pred_norm * 3.0 + 1.0, 1.0, 4.0)
-    print(f"  Input : Temp=72°F, Visibility=10mi, Humidity=65%")
-    print(f"  DENFIS predicted Severity ≈ {pred_sev:.2f}  (1=minor … 4=critical)")
-    print("────────────────────────────────────────────────────────────\n")
+    print(f"  Input : Temp=72 °F, Visibility=10 mi, Humidity=65 %")
+    print(f"  DENFIS Severity ≈ {pred_sev:.2f}  (1=minor … 4=critical)")
+    print("─────────────────────────────────────────────────────────────\n")
 
-    return model, metrics
+    # ── Step 7: Export ───────────────────────────────────────────────
+    save_model(model, scaler, metrics, path=MODEL_PATH)
+    print(f"[DONE]  Run  python test_trained_model.py  to test the model.\n")
+
+    return model, scaler, metrics
 
 
 # ─────────────────────────────────────────────────────────────
 #  ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    model, metrics = main()
+    model, scaler, metrics = main()
