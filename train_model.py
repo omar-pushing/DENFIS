@@ -542,7 +542,7 @@ def main():
 
 # Persistence
     save_model(model, scaler, metrics, path=MODEL_PATH)
-    print(f"[DONE]  Run  python test_trained_model.py  to test the model.\n")
+    print(f"[DONE]  Run  python test_model.py  to test the model.\n")
 
     return model, scaler, metrics
 

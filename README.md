@@ -13,8 +13,11 @@ pip install numpy pandas scikit-learn
 #    https://www.kaggle.com/datasets/sobhanmoosavi/us-accidents
 #    Place  US_Accidents_March23.csv  in the same folder as the script.
 
-# 3. Run
-python denfis_us_accidents.py
+# 3. Train the model
+python train_model.py
+
+# 4. Run the test scenarios
+python test_model.py
 ```
 
 Expected runtime: ~3–6 minutes for 600 000 rows on a modern laptop.
