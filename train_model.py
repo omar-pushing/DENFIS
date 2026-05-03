@@ -316,10 +316,20 @@ class DENFIS:
 
         Ph      = self.P @ h
         denom   = self.lam + h @ Ph
+
+        # Stability check: prevent division by zero or tiny values that cause NaNs
+        if abs(denom) < 1e-12:
+            return
+
         K_gain  = Ph / denom
 
-        self.theta = self.theta + K_gain * error
-        self.P     = (self.P - np.outer(K_gain, h @ self.P)) / self.lam
+        new_theta = self.theta + K_gain * error
+        # Guard against NaN propagation
+        if not np.isnan(new_theta).any():
+            self.theta = new_theta
+            new_P = (self.P - np.outer(K_gain, h @ self.P)) / self.lam
+            # Enforce symmetry to maintain numerical stability
+            self.P = (new_P + new_P.T) * 0.5
 
     def fit(self, X: np.ndarray, y: np.ndarray,
             log_every: int = 50_000) -> "DENFIS":
@@ -437,7 +447,7 @@ def evaluate(model: DENFIS,
 
     return {"mse": mse, "rmse": rmse, "mae": mae, "mae_severity": mae_sev}
 
-MODEL_PATH = "denfis_trained_model.pkl"
+MODEL_PATH = "model.pkl"
 
 # Save model and scaler to a file
 def save_model(model: "DENFIS", scaler: MinMaxScaler,
@@ -469,10 +479,10 @@ def load_model(path: str = MODEL_PATH) -> tuple:
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"No saved model found at '{path}'.\n"
-            f"Run  python denfis_us_accidents.py  first to train and export."
+            f"Run  python train_model.py  first to train and export."
         )
 # Handle case where main module name changes during import
-    import denfis_us_accidents as _self_module
+    import train_model as _self_module
 
     class _FixedUnpickler(pickle.Unpickler):
         def find_class(self, module, name):

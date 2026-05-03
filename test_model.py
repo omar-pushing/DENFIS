@@ -4,9 +4,9 @@ import numpy as np
 
 # Attempt to load the shared utilities from the main training script
 try:
-    from denfis_us_accidents import load_model, FEATURE_NAMES, _label_feature
+    from train_model import load_model, FEATURE_NAMES, _label_feature
 except ImportError:
-    print("\n[ERROR] Cannot import denfis_us_accidents.py")
+    print("\n[ERROR] Cannot import train_model.py")
     print("        Both files must be in the same folder.\n")
     sys.exit(1)
 
@@ -87,7 +87,13 @@ def predict_case(model, scaler, temp_f, vis_mi, hum_pct):
 
     # Run inference and convert 0-1 output back to 1-4 scale
     y_norm  = model.predict_one(x_norm)
-    sev_f   = float(np.clip(y_norm * 3.0 + 1.0, 1.0, 4.0))
+
+    # Handle potential NaN values from model instability
+    if np.isnan(y_norm):
+        sev_f = 2.0  # Fallback to neutral severity
+    else:
+        sev_f = float(np.clip(y_norm * 3.0 + 1.0, 1.0, 4.0))
+
     sev_i   = int(round(sev_f))
     sev_i   = max(1, min(4, sev_i))
 
@@ -169,7 +175,7 @@ def print_summary(results_log):
 
 def main():
     # Load saved model bundle
-    model, scaler, metrics, meta = load_model("denfis_trained_model.pkl")
+    model, scaler, metrics, meta = load_model("model.pkl")
 
     print(f"  {'─'*40}")
     print(f"  Fuzzy rules (ECM clusters) : {meta['n_rules']}")
@@ -189,7 +195,7 @@ def main():
     print_summary(results_log)
 
     # Extract top rules for interpretability
-    from denfis_us_accidents import extract_rules
+    from train_model import extract_rules
     extract_rules(model, FEATURE_NAMES, n_rules=3)
 
     print("  To predict your own accident conditions, run:")
