@@ -1,0 +1,23 @@
+{
+  "buildCommand": "pip install -r requirements.txt",
+  "outputDirectory": "public",
+  "framework": "flask",
+  "routes": [
+    {
+      "src": "/assets/(.*)",
+      "dest": "/assets/$1"
+    },
+    {
+      "src": "/(.*\\.(js|css|png|jpg|ico|svg)$)",
+      "dest": "/$1"
+    },
+    {
+      "src": "/predict",
+      "dest": "/api/index.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/api/index.py"
+    }
+  ]
+}
