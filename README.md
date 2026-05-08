@@ -164,17 +164,6 @@ POST /predict
 
 ---
 
-## Rebuilding the Frontend
-
-The frontend was built with React + Vite. To rebuild:
-
-```bash
-# (Frontend source not included in this repo)
-# Original source was in DENFIS-Site/ folder
-```
-
----
-
 ## References
 
 - Kasabov, N. & Song, Q. (2002). *DENFIS: Dynamic evolving neural-fuzzy inference system and its application for time-series prediction.* IEEE TFS, 10(2), 144–154.
