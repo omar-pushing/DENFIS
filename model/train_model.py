@@ -160,20 +160,6 @@ def stream_train(model, filepath: str,
     print(f"            Fuzzy rules  : {model.ecm.n_clusters()}")
     return X_test, y_test
 
-# legacy static preprocessing for smaller subsets
-def load_and_preprocess(filepath: str, nrows: int) -> tuple:
-    df = pd.read_csv(filepath, nrows=nrows,
-                     usecols=FEATURE_COLS + [TARGET_COL],
-                     dtype=DTYPE_MAP, low_memory=True)
-    for col in FEATURE_COLS:
-        df[col].fillna(df[col].median(), inplace=True)
-    df.dropna(inplace=True)
-    df = df[df[TARGET_COL].between(1, 4)]
-    scaler = MinMaxScaler()
-    X = scaler.fit_transform(df[FEATURE_COLS].values).astype(np.float64)
-    y = (df[TARGET_COL].values.astype(np.float64) - 1.0) / 3.0
-    return X, y, scaler, df
-
 # Evolving Clustering Method: Grows the rule base dynamically
 class ECM:
     def __init__(self, D_thr: float = 0.3):
@@ -351,8 +337,6 @@ class DENFIS:
         return np.array([self.predict_one(x) for x in X])
 
 # Linguistic translation helpers for rule extraction
-FEATURE_NAMES = ["Temperature(F)", "Visibility(mi)", "Humidity(%)"]
-
 # Maps normalized values to text labels for readability
 def _label_feature(feat_name: str, value: float) -> str:
     if feat_name == "Temperature(F)":
@@ -528,7 +512,7 @@ def main():
 # Evaluation and Rule Display
     metrics = evaluate(model, X_test, y_test)
 
-    extract_rules(model, FEATURE_NAMES, n_rules=3)
+    extract_rules(model, FEATURE_COLS, n_rules=3)
 
 # Quick test on a typical sample
     print("─── Example prediction ──────────────────────────────────────")

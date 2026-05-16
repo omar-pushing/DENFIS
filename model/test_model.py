@@ -4,7 +4,7 @@ import numpy as np
 
 # Attempt to load the shared utilities from the main training script
 try:
-    from model.train_model import load_model, FEATURE_NAMES, _label_feature
+    from model.train_model import load_model, FEATURE_COLS, _label_feature
 except ImportError:
     print("\n[ERROR] Cannot import train_model.py")
     print("        Both files must be in the same folder.\n")
@@ -106,7 +106,7 @@ def predict_case(model, scaler, temp_f, vis_mi, hum_pct):
 
     rule_antecedent = " AND ".join(
         f"{fname} is {_label_feature(fname, float(centre[j]))}"
-        for j, fname in enumerate(FEATURE_NAMES)
+        for j, fname in enumerate(FEATURE_COLS)
     )
 
     return {
@@ -196,7 +196,7 @@ def main():
 
     # Extract top rules for interpretability
     from model.train_model import extract_rules
-    extract_rules(model, FEATURE_NAMES, n_rules=3)
+    extract_rules(model, FEATURE_COLS, n_rules=3)
 
     print("  To predict your own accident conditions, run:")
     print("      python predict_severity.py\n")
