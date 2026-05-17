@@ -466,7 +466,7 @@ def load_model(path: str = MODEL_PATH) -> tuple:
             f"Run  python train_model.py  first to train and export."
         )
 # Handle case where main module name changes during import
-    import model.train_model as _self_module
+    import model.train_model as _self_module # type: ignore
 
     class _FixedUnpickler(pickle.Unpickler):
         def find_class(self, module, name):

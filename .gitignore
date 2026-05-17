@@ -1,0 +1,29 @@
+# Dataset (large file, not committed)
+US_Accidents_March23.csv
+US_Accidents_March23.csv.zip
+US_Accidents_March23.csv.zip.crdownload
+
+# Trained model bundle
+*.pkl
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Notebook checkpoints & outputs
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
